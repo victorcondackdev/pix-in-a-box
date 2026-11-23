@@ -9,7 +9,7 @@
 # Component refs are build args, so a release can pin every component:
 #   docker build --build-arg LEDGER_GO_REF=v0.1.0 ...
 
-FROM golang:1.24-alpine AS build
+FROM golang:1.27-alpine AS build
 RUN apk add --no-cache git
 WORKDIR /src
 ARG BRPAY_REF=v0.1.0
