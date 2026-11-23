@@ -1,0 +1,9 @@
+# Machine-local Go workspace (scripts/workspace.sh generates it).
+go.work
+go.work.sum
+
+/bin/
+/dist/
+coverage.out
+*.test
+.env

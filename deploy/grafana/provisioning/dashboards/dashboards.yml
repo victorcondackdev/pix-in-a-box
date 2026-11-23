@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: pix-in-a-box
+    folder: pix-in-a-box
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: gateway, merchant, contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false # no go.sum: every dependency comes from the workspace
+      - name: Assemble the workspace (component repos at main, brpay at v0.1.0)
+        # Outside the checkout, so ./... only matches this repository.
+        run: CONTRACTS=1 scripts/workspace.sh "$RUNNER_TEMP/components"
+      - name: Component revisions
+        run: for d in "$RUNNER_TEMP"/components/*; do echo "$(basename "$d") $(git -C "$d" rev-parse --short HEAD)"; done
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: Contract checks against the component sources
+        run: scripts/check-contracts.sh
+      - name: shellcheck
+        run: shellcheck -S error scripts/*.sh
+
+  notifier:
+    name: notifier (franz-go module)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/notifier
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Resolve dependencies (creates go.sum until it is committed)
+        run: go mod tidy
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  compose:
+    name: compose file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet

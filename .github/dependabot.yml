@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: { interval: weekly }
+    # The component repositories are consumed as a workspace at main
+    # (scripts/workspace.sh); their versions here are release markers.
+    ignore:
+      - dependency-name: "github.com/victorcondackdev/*"
+  - package-ecosystem: gomod
+    directory: /services/notifier
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /services/notifier
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }

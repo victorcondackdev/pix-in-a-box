@@ -1,0 +1,30 @@
+{
+  "name": "pix-in-a-box",
+  "description": "The PSP's settlement account at the SPI (every customer and merchant of pix-in-a-box is a sub-ledger of it), the merchant's Pix key, and an external payer at another bank. Payees for the demo are opened at runtime by scripts/demo.sh.",
+  "accounts": [
+    {
+      "id": "pib",
+      "owner_name": "Pix in a Box Instituicao de Pagamento S.A.",
+      "document": "11.222.333/0001-81",
+      "ispb": "13370001",
+      "branch": "0001",
+      "number": "100001",
+      "type": "CACC",
+      "initial_balance_cents": 100000000,
+      "webhook": { "url": "http://gateway:8080/v1/webhooks/spi", "secret": "pixsim_whsec_local_dev" }
+    },
+    {
+      "id": "maria",
+      "owner_name": "Maria Souza",
+      "document": "529.982.247-25",
+      "ispb": "10000001",
+      "branch": "0001",
+      "number": "300001",
+      "initial_balance_cents": 5000000
+    }
+  ],
+  "keys": [
+    { "account_id": "pib", "key": "loja@pixinabox.dev" }
+  ],
+  "dict_rate_limit": { "capacity": 200, "refill_per_minute": 60, "not_found_cost": 3 }
+}

@@ -1,0 +1,7 @@
+# go.work holds machine-local paths; the image builds its own workspace.
+go.work
+go.work.sum
+.git
+.github
+docs
+**/*_test.go

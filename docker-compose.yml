@@ -1,0 +1,256 @@
+# pix-in-a-box: a Pix PSP assembled from independent open-source components.
+#
+#   docker compose up -d --build --wait     # everything healthy, ~2-4 min on first build
+#   ./scripts/demo.sh                       # narrated scenarios (add --assert in CI)
+#   open http://localhost:3000              # Grafana, dashboard "Pix in a Box"
+#
+# Component services are built straight from their public repositories
+# (git build contexts), so this file is the integration contract: every
+# port, environment variable and route used here is checked against the
+# component sources by scripts/check-contracts.sh.
+#
+# All secrets below are local development values.
+
+name: pix-in-a-box
+
+x-go-service: &go-service
+  restart: unless-stopped
+  networks: [pix]
+  stop_grace_period: 20s
+
+services:
+  # --- infrastructure -------------------------------------------------------
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [pix]
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      # dev-container mode enables topic auto-creation; production topics
+      # are created by infrastructure code, not by producers.
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks: [pix]
+
+  # --- components (built from their repositories) ---------------------------
+
+  # Charges with BR Codes, settlement webhook idempotent on EndToEndId,
+  # transactional outbox to Kafka as CloudEvents.
+  payments:
+    <<: *go-service
+    build:
+      context: https://github.com/victorcondackdev/payments-service-go.git#main
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://payments:payments@postgres:5432/payments?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_AUTO_CREATE_TOPICS: "true"
+      EVENT_TOPIC: payments.events.v1
+      EVENT_SOURCE: urn:pix-in-a-box:payments-service
+      OUTBOX_POLL_INTERVAL: 200ms
+      WEBHOOK_SECRET: payments-local-dev-secret
+      # The charge receiver: the merchant's key at this PSP (registered in
+      # the SPI scenario) and the name/city printed in the BR Code.
+      PIX_KEY: loja@pixinabox.dev
+      MERCHANT_NAME: Loja Exemplo
+      MERCHANT_CITY: Rio de Janeiro
+      LOG_LEVEL: info
+    ports: ["8082:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+
+  # SPI + DICT + counterparty PSPs: async ACSC/RJCT, signed webhooks,
+  # refunds, MED, chaos headers.
+  pixsim:
+    <<: *go-service
+    build:
+      context: https://github.com/victorcondackdev/pix-psp-simulator.git#main
+      target: pixsim
+    environment:
+      PIXSIM_ADDR: ":8080"
+      PIXSIM_SCENARIOS: /etc/pixsim/pix-in-a-box.json
+      PIXSIM_BASE_URL: http://localhost:8090
+      PIXSIM_SETTLEMENT_LATENCY: 300ms
+      PIXSIM_WEBHOOK_BASE_BACKOFF: 500ms
+      PIXSIM_SEED: "42"
+      PIXSIM_LOG_FORMAT: json
+    volumes:
+      - ./deploy/pixsim/pix-in-a-box.json:/etc/pixsim/pix-in-a-box.json:ro
+    ports: ["8090:8080"]
+    healthcheck:
+      test: ["CMD", "/pixsim", "-healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Risk engine with explained decisions. The ruleset is the PSP's own
+  # file, mounted read-only; SIGHUP (docker compose kill -s HUP riskd)
+  # hot-reloads it. The image's ENTRYPOINT already passes -addr and
+  # -ruleset; the flag below comes later and wins.
+  riskd:
+    <<: *go-service
+    build:
+      context: https://github.com/victorcondackdev/fraud-rules-go.git#main
+    command: ["-ruleset", "/etc/riskd/pix-in-a-box.json", "-budget", "25ms"]
+    volumes:
+      - ./deploy/riskd/pix-in-a-box.json:/etc/riskd/pix-in-a-box.json:ro
+    ports: ["8083:8080"]
+
+  # Outbound webhooks: WAL, retries, DLQ, Standard Webhooks signatures.
+  # Plain http and the compose subnet are allowed explicitly: the SSRF
+  # guard refuses private addresses by default.
+  relayd:
+    <<: *go-service
+    build:
+      context: https://github.com/victorcondackdev/webhook-relay-go.git#main
+    environment:
+      RELAY_ADDR: ":8080"
+      RELAY_DATA_DIR: /var/lib/webhook-relay
+      RELAY_FSYNC: always
+      RELAY_ALLOW_HTTP: "true"
+      RELAY_ALLOW_CIDRS: 10.250.0.0/24
+      RELAY_API_TOKEN: relay-local-dev-token
+      RELAY_REQUEST_TIMEOUT: 5s
+    volumes:
+      - relay-wal:/var/lib/webhook-relay
+    ports: ["8084:8080"]
+
+  # --- this repository --------------------------------------------------------
+
+  # The PSP core: ledger, payouts, inbound Pix, refunds/MED, notifications.
+  gateway:
+    <<: *go-service
+    build:
+      context: .
+      target: gateway
+    environment:
+      GATEWAY_ADDR: ":8080"
+      GATEWAY_LOG_LEVEL: info
+      GATEWAY_ISPB: "13370001"
+      GATEWAY_SPI_ACCOUNT_ID: pib
+      PIXSIM_URL: http://pixsim:8080
+      PIXSIM_WEBHOOK_SECRET: pixsim_whsec_local_dev
+      RISKD_URL: http://riskd:8080
+      GATEWAY_RISK_FAIL_MODE: closed
+      RELAY_URL: http://relayd:8080
+      RELAY_API_TOKEN: relay-local-dev-token
+      PAYMENTS_URL: http://payments:8080
+      PAYMENTS_WEBHOOK_SECRET: payments-local-dev-secret
+      MERCHANT_ID: loja
+      MERCHANT_NAME: Loja Exemplo
+      MERCHANT_PIX_KEY: loja@pixinabox.dev
+      MERCHANT_WEBHOOK_URL: http://merchant:8080/webhooks
+      MERCHANT_WEBHOOK_SECRET: whsec_cGl4LWluLWEtYm94LW1lcmNoYW50LWRlbW8ta2V5LTAwMDE=
+      # Sandbox only: forward X-Sim-* chaos headers, honour X-Sim-Time.
+      GATEWAY_SIM_HEADERS: "true"
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "/gateway", "-healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    depends_on:
+      pixsim: { condition: service_healthy }
+      merchant: { condition: service_healthy }
+      riskd: { condition: service_started }
+      relayd: { condition: service_started }
+      payments: { condition: service_started }
+
+  # CloudEvents from payments-service (Kafka) → relayd → merchant.
+  notifier:
+    <<: *go-service
+    build:
+      context: ./services/notifier
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      NOTIFIER_TOPIC: payments.events.v1
+      NOTIFIER_GROUP: pix-in-a-box-notifier
+      RELAY_URL: http://relayd:8080
+      RELAY_API_TOKEN: relay-local-dev-token
+      NOTIFIER_ADDR: ":8080"
+    ports: ["8085:8080"]
+    healthcheck:
+      test: ["CMD", "/notifier", "-healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redpanda: { condition: service_healthy }
+      # The merchant endpoint must exist in relayd before events flow.
+      gateway: { condition: service_healthy }
+
+  # Example merchant backend: verifies signatures, deduplicates, records.
+  merchant:
+    <<: *go-service
+    build:
+      context: .
+      target: merchant
+    environment:
+      MERCHANT_ADDR: ":8080"
+      MERCHANT_WEBHOOK_SECRET: whsec_cGl4LWluLWEtYm94LW1lcmNoYW50LWRlbW8ta2V5LTAwMDE=
+    ports: ["8070:8080"]
+    healthcheck:
+      test: ["CMD", "/merchant", "-healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # --- observability ----------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    networks: [pix]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pix.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [pix]
+
+volumes:
+  relay-wal:
+
+networks:
+  pix:
+    # Pinned so relayd can allow exactly this range (RELAY_ALLOW_CIDRS).
+    # Change both if 10.250.0.0/24 collides with a local network.
+    ipam:
+      config:
+        - subnet: 10.250.0.0/24

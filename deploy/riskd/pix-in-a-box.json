@@ -1,0 +1,360 @@
+{
+  "name": "pix-in-a-box",
+  "version": "0.1.0",
+  "description": "Pre-authorization ruleset of the pix-in-a-box PSP. Starts as a pinned copy of fraud-rules-go's illustrative pix-default 0.1.0 rules (scripts/check-contracts.sh reports any drift from upstream); owned and versioned with the PSP, hot-reloadable with SIGHUP. Thresholds are examples, not regulatory values.",
+  "time_zone": "America/Sao_Paulo",
+  "thresholds": {
+    "review": 40,
+    "step_up": 70,
+    "block": 120
+  },
+  "fail_modes": {
+    "BLOCK": "closed",
+    "HOLD": "open",
+    "STEP_UP": "open",
+    "REVIEW": "open"
+  },
+  "rules": [
+    {
+      "id": "limit.night.pf",
+      "description": "Natural person above their own nighttime (20h-6h) per-transaction limit.",
+      "expr": "payer.type == \"PF\" && isNight(tx.time) && payer.night_limit > 0 && tx.amount > payer.night_limit",
+      "action": "BLOCK",
+      "score": 100,
+      "tags": [
+        "limits"
+      ]
+    },
+    {
+      "id": "limit.day",
+      "description": "Above the customer's daytime per-transaction limit.",
+      "expr": "!isNight(tx.time) && payer.day_limit > 0 && tx.amount > payer.day_limit",
+      "action": "BLOCK",
+      "score": 100,
+      "tags": [
+        "limits"
+      ]
+    },
+    {
+      "id": "limit.night.cumulative",
+      "description": "Nighttime outflow over twice the nighttime limit within 6h: cautionary hold instead of a hard block.",
+      "expr": "payer.type == \"PF\" && isNight(tx.time) && payer.night_limit > 0 && sum(payer.transfers, 6h) + tx.amount > 2 * payer.night_limit",
+      "action": "HOLD",
+      "hold_for": "1h",
+      "score": 40,
+      "on_error": "closed",
+      "tags": [
+        "limits",
+        "night"
+      ]
+    },
+    {
+      "id": "device.new.high_value",
+      "description": "Device seen for less than 24h moving more than R$ 200,00 in one transfer.",
+      "expr": "!payer.device.trusted && age(payer.device.first_seen) < 24h && tx.amount > 200_00",
+      "action": "STEP_UP",
+      "score": 30,
+      "tags": [
+        "device"
+      ]
+    },
+    {
+      "id": "device.new.daily_cap",
+      "description": "Device seen for less than 24h above R$ 1.000,00 cumulative in a day.",
+      "expr": "!payer.device.trusted && age(payer.device.first_seen) < 24h && sum(device.transfers, 1d) + tx.amount > 1000_00",
+      "action": "BLOCK",
+      "score": 60,
+      "on_error": "open",
+      "tags": [
+        "device"
+      ]
+    },
+    {
+      "id": "ato.new_device.night_drain",
+      "description": "Account takeover signature: brand-new untrusted device draining the account at night.",
+      "expr": "!payer.device.trusted && age(payer.device.first_seen) < 2h && isNight(tx.time) && count(payer.transfers, 30m) >= 1",
+      "action": "BLOCK",
+      "score": 80,
+      "on_error": "open",
+      "tags": [
+        "ato",
+        "device",
+        "night"
+      ]
+    },
+    {
+      "id": "beneficiary.first.high_value",
+      "description": "First transfer to this beneficiary in 90 days, R$ 500,00 or more.",
+      "expr": "count(pair.transfers, 90d) == 0 && tx.amount >= 500_00",
+      "action": "REVIEW",
+      "score": 20,
+      "tags": [
+        "beneficiary"
+      ]
+    },
+    {
+      "id": "beneficiary.first.night",
+      "description": "First transfer to this beneficiary, at night, R$ 300,00 or more.",
+      "expr": "count(pair.transfers, 90d) == 0 && isNight(tx.time) && tx.amount >= 300_00",
+      "action": "STEP_UP",
+      "score": 25,
+      "tags": [
+        "beneficiary",
+        "night"
+      ]
+    },
+    {
+      "id": "beneficiary.fraud_marks.multiple",
+      "description": "Beneficiary with two or more fraud reports (e.g. MED disputes).",
+      "expr": "beneficiary.fraud_marks >= 2",
+      "action": "BLOCK",
+      "score": 80,
+      "tags": [
+        "beneficiary",
+        "med"
+      ]
+    },
+    {
+      "id": "beneficiary.fraud_marks.single",
+      "description": "Beneficiary with one fraud report.",
+      "expr": "beneficiary.fraud_marks == 1",
+      "action": "REVIEW",
+      "score": 35,
+      "tags": [
+        "beneficiary",
+        "med"
+      ]
+    },
+    {
+      "id": "beneficiary.new_key",
+      "description": "Pix key registered less than 72h ago, never paid by this customer.",
+      "expr": "age(beneficiary.key_created) < 72h && count(pair.transfers, 90d) == 0",
+      "action": "REVIEW",
+      "score": 20,
+      "tags": [
+        "beneficiary"
+      ]
+    },
+    {
+      "id": "beneficiary.new_account.high_value",
+      "description": "Receiving account opened less than 30 days ago, R$ 1.000,00 or more.",
+      "expr": "age(beneficiary.account_created) < 30d && tx.amount >= 1000_00",
+      "action": "REVIEW",
+      "score": 20,
+      "tags": [
+        "beneficiary"
+      ]
+    },
+    {
+      "id": "beneficiary.fan_in",
+      "description": "Many distinct payers to one beneficiary within 1h: collection account of a scam (MED pattern).",
+      "expr": "distinct(beneficiary.received, 1h) >= 6",
+      "action": "HOLD",
+      "hold_for": "2h",
+      "score": 40,
+      "tags": [
+        "mule",
+        "med"
+      ]
+    },
+    {
+      "id": "beneficiary.fan_in.new_account",
+      "description": "Fan-in into an account opened less than 30 days ago.",
+      "expr": "distinct(beneficiary.received, 2h) >= 3 && age(beneficiary.account_created) < 30d",
+      "action": "BLOCK",
+      "score": 60,
+      "on_error": "open",
+      "tags": [
+        "mule",
+        "med"
+      ]
+    },
+    {
+      "id": "velocity.burst.10m",
+      "description": "Five or more transfers in 10 minutes.",
+      "expr": "count(payer.transfers, 10m) >= 5",
+      "action": "STEP_UP",
+      "score": 30,
+      "tags": [
+        "velocity"
+      ]
+    },
+    {
+      "id": "velocity.amount.1h",
+      "description": "More than R$ 5.000,00 sent within 1h, this transfer included.",
+      "expr": "sum(payer.transfers, 1h) + tx.amount > 5000_00",
+      "action": "REVIEW",
+      "score": 25,
+      "tags": [
+        "velocity"
+      ]
+    },
+    {
+      "id": "velocity.burst.night",
+      "description": "Three or more transfers in 30 minutes at night.",
+      "expr": "isNight(tx.time) && count(payer.transfers, 30m) >= 3",
+      "action": "HOLD",
+      "hold_for": "30m",
+      "score": 35,
+      "tags": [
+        "velocity",
+        "night"
+      ]
+    },
+    {
+      "id": "fanout.distinct.1h",
+      "description": "Six or more distinct beneficiaries within 1h: mule fan-out or account drain.",
+      "expr": "distinct(payer.transfers, 1h) >= 6",
+      "action": "STEP_UP",
+      "score": 45,
+      "tags": [
+        "mule",
+        "velocity"
+      ]
+    },
+    {
+      "id": "fanout.new_beneficiaries",
+      "description": "Paying a new beneficiary after three or more distinct beneficiaries in 30 minutes.",
+      "expr": "distinct(payer.transfers, 30m) >= 3 && count(pair.transfers, 90d) == 0",
+      "action": "STEP_UP",
+      "score": 40,
+      "tags": [
+        "mule",
+        "beneficiary"
+      ]
+    },
+    {
+      "id": "structuring.below_night_limit",
+      "description": "Repeated night transfers within 10% below the nighttime limit (structuring).",
+      "expr": "isNight(tx.time) && payer.night_limit > 0 && tx.amount between payer.night_limit * 90 / 100 and payer.night_limit && count(payer.transfers, 2h) >= 1",
+      "action": "REVIEW",
+      "score": 35,
+      "tags": [
+        "structuring",
+        "night"
+      ]
+    },
+    {
+      "id": "structuring.below_day_limit",
+      "description": "Repeated daytime transfers within 5% below the daytime limit.",
+      "expr": "!isNight(tx.time) && payer.day_limit > 0 && tx.amount between payer.day_limit * 95 / 100 and payer.day_limit && count(payer.transfers, 3h) >= 1",
+      "action": "REVIEW",
+      "score": 30,
+      "tags": [
+        "structuring"
+      ]
+    },
+    {
+      "id": "structuring.repeated_pair",
+      "description": "Third transfer of R$ 500,00 or more to the same beneficiary within 2h.",
+      "expr": "tx.amount >= 500_00 && count(pair.transfers, 2h) >= 2",
+      "action": "REVIEW",
+      "score": 20,
+      "tags": [
+        "structuring"
+      ]
+    },
+    {
+      "id": "payer.new_account",
+      "description": "Payer account opened less than 7 days ago sending R$ 1.000,00 or more.",
+      "expr": "age(payer.account_created) < 7d && tx.amount >= 1000_00",
+      "action": "REVIEW",
+      "score": 15,
+      "tags": [
+        "account"
+      ]
+    },
+    {
+      "id": "device.shared",
+      "description": "Device used by three or more customers within a day (device farm).",
+      "expr": "distinct(device.transfers, 1d) >= 3",
+      "action": "REVIEW",
+      "score": 25,
+      "tags": [
+        "device"
+      ]
+    },
+    {
+      "id": "ip.shared",
+      "description": "IP used by five or more customers within 1h.",
+      "expr": "distinct(ip.transfers, 1h) >= 5",
+      "action": "REVIEW",
+      "score": 15,
+      "tags": [
+        "device"
+      ]
+    },
+    {
+      "id": "channel.api.night.pf",
+      "description": "Natural person transferring through the API channel at night.",
+      "expr": "tx.channel == \"api\" && payer.type == \"PF\" && isNight(tx.time)",
+      "action": "REVIEW",
+      "score": 10,
+      "tags": [
+        "channel"
+      ]
+    },
+    {
+      "id": "payer.vulnerable.new_beneficiary",
+      "description": "Customer flagged as senior paying a new beneficiary R$ 300,00 or more.",
+      "expr": "\"senior\" in payer.tags && count(pair.transfers, 90d) == 0 && tx.amount >= 300_00",
+      "action": "STEP_UP",
+      "score": 20,
+      "tags": [
+        "beneficiary"
+      ]
+    },
+    {
+      "id": "trust.known_beneficiary",
+      "description": "Offset: established beneficiary, paid at least twice before the last 7 days, with no fraud reports. Counting only older transfers keeps a burst to a new mule from earning trust.",
+      "expr": "count(pair.transfers, 90d) - count(pair.transfers, 7d) >= 2 && beneficiary.fraud_marks == 0",
+      "action": "ALLOW",
+      "score": -20,
+      "tags": [
+        "trust"
+      ]
+    },
+    {
+      "id": "trust.mature_device",
+      "description": "Offset: trusted device in use for more than 30 days.",
+      "expr": "payer.device.trusted && age(payer.device.first_seen) > 30d",
+      "action": "ALLOW",
+      "score": -10,
+      "tags": [
+        "trust"
+      ]
+    },
+    {
+      "id": "shadow.fanout.distinct.30m",
+      "description": "Candidate: tighter fan-out, four distinct beneficiaries in 30 minutes.",
+      "expr": "distinct(payer.transfers, 30m) >= 4",
+      "action": "STEP_UP",
+      "score": 45,
+      "mode": "shadow",
+      "tags": [
+        "mule",
+        "candidate"
+      ]
+    },
+    {
+      "id": "shadow.night.new_beneficiary.untrusted",
+      "description": "Candidate: block first transfers to a new beneficiary from an untrusted device at night.",
+      "expr": "isNight(tx.time) && !payer.device.trusted && count(pair.transfers, 90d) == 0",
+      "action": "BLOCK",
+      "score": 60,
+      "mode": "shadow",
+      "tags": [
+        "ato",
+        "candidate"
+      ]
+    },
+    {
+      "id": "weekend.high_value",
+      "description": "Disabled example: high-value transfers on weekends.",
+      "expr": "weekday(tx.time) in [0, 6] && tx.amount >= 3000_00",
+      "action": "REVIEW",
+      "score": 10,
+      "enabled": false
+    }
+  ]
+}
