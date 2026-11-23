@@ -2,7 +2,7 @@
 #
 # The notifier is its own module (franz-go is its only dependency). go.sum
 # is produced by `go mod tidy` when it is not committed yet.
-FROM golang:1.24-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 ENV CGO_ENABLED=0 GOWORK=off
 COPY . .
